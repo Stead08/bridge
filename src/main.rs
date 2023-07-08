@@ -1,147 +1,77 @@
-mod packets;
-
 use std::env;
-
-use crate::packets::GettableEndPoints;
-use log::{error, info};
-use pnet::datalink;
-use pnet::datalink::Channel::Ethernet;
-use pnet::packet::ethernet::{EtherTypes, EthernetPacket};
-use pnet::packet::ip::IpNextHeaderProtocols;
-use pnet::packet::ipv4::Ipv4Packet;
-use pnet::packet::ipv6::Ipv6Packet;
-use pnet::packet::tcp::TcpPacket;
-use pnet::packet::udp::UdpPacket;
+use pnet::datalink::{self, Channel::Ethernet, DataLinkReceiver, DataLinkSender, NetworkInterface};
+use pnet::packet::ethernet::EthernetPacket;
+use tokio::task;
+use log::{debug, error};
 use pnet::packet::Packet;
 
-const WIDTH: usize = 20;
-
-fn main() {
+/**
+* Bridge between two network interfaces.
+*/
+#[tokio::main]
+async fn main() {
     env::set_var("RUST_LOG", "debug");
     env_logger::init();
+
     let args: Vec<String> = env::args().collect();
-    if args.len() != 2 {
-        error!("Please specify target interface name");
+    if args.len() != 3 {
+        error!("Please specify target interface name [target1] [target2]");
         std::process::exit(1);
     }
-    let interface_name = &args[1];
+    let interface_name_1 = &args[1];
+    let interface_name_2 = &args[2];
 
-    //インターフェースの選択
-    let interfaces = datalink::interfaces();
-    let interface = interfaces
-        .into_iter()
-        .find(|iface| iface.name == *interface_name)
-        .expect("Failed to get interface");
+    let (interface_1, tx1, rx1) = get_interface_and_channel(interface_name_1);
+    let (interface_2, tx2, rx2) = get_interface_and_channel(interface_name_2);
 
-    let (_tx, mut rx) = match datalink::channel(&interface, Default::default()) {
-        Ok(Ethernet(tx, rx)) => (tx, rx),
-        Ok(_) => panic!("Unhandled channel type"),
-        Err(e) => panic!("Failed to create datalink channel {}", e),
-    };
+    // `interface_1`から`interface_2`への送信タスク
+    let task1 = task::spawn(relay_packets(tx2, rx1, interface_2));
 
+    // `interface_2`から`interface_1`への送信タスク
+    let task2 = task::spawn(relay_packets(tx1, rx2, interface_1));
+
+    // タスクが完了するのを待つ
+    let _ = tokio::try_join!(task1, task2);
+}
+
+/**
+* パケットを中継する
+*/
+async fn relay_packets(mut tx: Box<dyn DataLinkSender>, mut rx: Box<dyn DataLinkReceiver>, interface: NetworkInterface) {
     loop {
         match rx.next() {
             Ok(frame) => {
                 let frame = EthernetPacket::new(frame).unwrap();
-                match frame.get_ethertype() {
-                    EtherTypes::Ipv4 => {
-                        ipv4_handler(&frame);
-                    }
-                    EtherTypes::Ipv6 => {
-                        ipv6_handler(&frame);
-                    }
-                    _ => {
-                        info!("Not an IPv4 or IPv6 packet");
-                    }
-                }
+                let destination = &frame.get_destination();
+                let source = &frame.get_source();
+                let ether_type = frame.get_ethertype();
+                let ether_type_hex = ether_type.0;
+
+                debug!(
+                    "Destination: {}, Source: {}, EtherType: {}({:#x})",
+                    destination, source, ether_type, ether_type_hex,);
+
+                tx.send_to(frame.packet(), Some(interface.clone()));
             }
             Err(e) => error!("Failed to read: {}", e),
         }
     }
 }
 
-fn ipv4_handler(ethernet: &EthernetPacket) {
-    if let Some(packet) = Ipv4Packet::new(ethernet.payload()) {
-        match packet.get_next_level_protocol() {
-            IpNextHeaderProtocols::Tcp => {
-                tcp_handler(&packet);
-            }
-            IpNextHeaderProtocols::Udp => {
-                udp_handler(&packet);
-            }
-            _ => info!("Not a TCP or UDP packet"),
-        }
-    }
-}
-/*
-* IPv6 パケットを構築し次のレイヤのハンドラを呼び出す
- */
-
-fn ipv6_handler(ethernet: &EthernetPacket) {
-    if let Some(packet) = Ipv6Packet::new(ethernet.payload()) {
-        match packet.get_next_header() {
-            IpNextHeaderProtocols::Tcp => tcp_handler(&packet),
-            IpNextHeaderProtocols::Udp => udp_handler(&packet),
-            _ => info!("Not a TCP or UDP packet"),
-        }
-    }
-}
-
-/*
-* TCP パケットを構築する
- */
-
-fn tcp_handler(packet: &dyn GettableEndPoints) {
-    let tcp = TcpPacket::new(packet.get_payload());
-    if let Some(tcp) = tcp {
-        print_packet_info(packet, &tcp, "TCP");
-    }
-}
-
-/*
-* UCP パケットを構築する
- */
-
-fn udp_handler(packet: &dyn GettableEndPoints) {
-    let udp = UdpPacket::new(packet.get_payload());
-    if let Some(udp) = udp {
-        print_packet_info(packet, &udp, "UDP");
-    }
-}
-
 /**
-* アプリケーション層のデータをバイナリで表示する
+* 指定された名前のネットワークインターフェースを取得する
 */
-fn print_packet_info(l3: &dyn GettableEndPoints, l4: &dyn GettableEndPoints, proto: &str) {
-    println!(
-        "Captured a {} packet from {}|{} to {}|{}\n",
-        proto,
-        l3.get_source(),
-        l4.get_source(),
-        l3.get_destination(),
-        l4.get_destination(),
-    );
-    let payload = l4.get_payload();
-    let len = payload.len();
+fn get_interface_and_channel(name: &str) -> (NetworkInterface, Box<dyn DataLinkSender>, Box<dyn DataLinkReceiver>) {
+    let interfaces = datalink::interfaces();
+    let interface = interfaces.into_iter()
+        .find(|iface| iface.name == *name)
+        .expect("Failed to get interface");
 
-    //ペイロードの表示
-    //指定された定数幅で表示を行う
-    for i in 0..len {
-        print!("{:<02X} ", payload[i]);
-        if i % WIDTH == WIDTH - 1 || i == len - 1 {
-            for _j in 0..WIDTH - 1 - (i % (WIDTH)) {
-                print!("   ");
-            }
-            print!("| ");
-            for &item in payload.iter().take(i + 1).skip(i - i % WIDTH) {
-                match std::str::from_utf8(&[item]) {
-                    Ok(utf8_str) => print!("{}", utf8_str),
-                    _ => print!("."),
-                }
-            }
-            println!();
-        }
-    }
-    println!("{}", "=".repeat(WIDTH * 3));
-    println!();
+    let (tx, rx) = match datalink::channel(&interface, Default::default()) {
+        Ok(Ethernet(tx, rx)) => (tx, rx),
+        Ok(_) => panic!("Unhandled channel type"),
+        Err(e) => panic!("Failed to create datalink channel {}", e),
+    };
+
+    (interface, tx, rx)
 }
